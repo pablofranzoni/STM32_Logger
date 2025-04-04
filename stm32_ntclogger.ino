@@ -1,8 +1,7 @@
-void setup() {
 /*
   Programa para STM32F103 (Blue Pill) que:
   - Mide temperatura con un sensor NTC cada 10 minutos
-  - Guarda los datos en una tarjeta SD, un archivo por día (TEMP_LOG_MMDD.CSV)
+  - Guarda los datos en una tarjeta SD, un archivo por día (TMP_MMDD.CSV)
   - Transmite datos almacenados cuando se solicita a través de RF24
   - Utiliza el RTC interno para controlar el tiempo
   - Conserva datos por hasta 360 días
@@ -11,7 +10,7 @@ void setup() {
 #include <SPI.h>
 #include <SD.h>
 #include <RF24.h>
-#include <RTClock.h>
+#include <STM32RTC.h>  // Nueva librería RTC
 #include <Wire.h>
 
 // Configuración de pines
@@ -27,8 +26,12 @@ void setup() {
 #define SERIES_RESISTOR 10000      // Valor de la resistencia en serie
 
 // Configuración para almacenamiento
-#define SAMPLES_PER_DAY 144        // 144 muestras por día (cada 10 minutos)
 #define MAX_DAYS 360               // Máximo número de días a almacenar
+// Configuración para almacenamiento (ahora variable según intervalo)
+#define MINUTES_PER_DAY 1440      // 1440 minutos en un día (24h * 60min)
+uint16_t maxSamplesPerDay;        // Se calculará según el intervalo
+uint16_t sampleCount = 0;         // Contador de muestras
+uint8_t samplingInterval = 10;    // Valor por defecto (10 minutos), se puede cambiar
 
 // Dirección de comunicación RF24
 const byte address[6] = "Node1";
@@ -41,12 +44,12 @@ const byte address[6] = "Node1";
 
 // Variables globales
 RF24 radio(RF24_CE_PIN, RF24_CSN_PIN);
-RTClock rtc(RTCSEL_LSE);
+STM32RTC& rtc = STM32RTC::getInstance();  // Obtener instancia del RTC
 File dataFile;
-uint32_t sampleCount = 0;
 char currentFilename[16];  // Para almacenar el nombre del archivo actual
 bool sdAvailable = false;
-uint32_t currentDay = 0;   // Para detectar cambios de día
+bool alarmTriggered = false;  // Para controlar cuando se debe tomar una medición
+uint32_t lastAlarmTime = 0;   // Para controlar la alarma manualmente
 
 // Estructura para fecha y hora
 struct DateTime {
@@ -81,6 +84,11 @@ struct FileListResponse {
   char filename[16];
 };
 
+// Función para manejar evento de alarma en STM32RTC
+void alarmMatch(void *data) {
+  alarmTriggered = true;
+}
+
 void setup() {
   // Inicialización de serial para depuración
   Serial.begin(115200);
@@ -110,10 +118,19 @@ void setup() {
   }
   
   // Inicializar RTC con fecha y hora inicial
+  // Configurar el RTC para usar LSE (cristal externo)
+  rtc.begin(STM32RTC::LSE_CLOCK);
+  
   // Establecer fecha/hora inicial (01/01/2025 00:00:00)
   // Esto es solo un ejemplo, en producción deberías obtener la fecha/hora actual
   DateTime initialDateTime = {2025, 1, 1, 0, 0, 0};
   setDateTime(initialDateTime);
+  
+  // Configurar intervalo inicial (ej. 5 minutos)
+  setSamplingInterval(5);
+
+  // Configurar callback para alarma
+  rtc.attachInterrupt(alarmMatch);
   
   // Configurar alarma para cada 10 minutos
   setupNextAlarm();
@@ -128,18 +145,9 @@ void loop() {
   // Comprobar si hay solicitudes RF24
   checkForRFRequests();
   
-  // Comprobar si es hora de tomar una medición (manejado por la interrupción del RTC)
-  if (rtc.getAlarmFlag()) {
-    rtc.clearAlarmFlag();
-    
-    // Verificar si ha cambiado el día
-    DateTime now = getCurrentDateTime();
-    uint32_t dayValue = now.year * 10000 + now.month * 100 + now.day;
-    
-    if (dayValue != currentDay) {
-      currentDay = dayValue;
-      updateCurrentFilename();
-    }
+  // Comprobar si es hora de tomar una medición (manejado por la alarma)
+  if (alarmTriggered) {
+    alarmTriggered = false;
     
     // Tomar una nueva medición
     takeMeasurement();
@@ -154,32 +162,26 @@ void loop() {
 
 // Establecer fecha y hora
 void setDateTime(DateTime dt) {
-  // Calcular segundos desde el inicio del día
-  uint32_t secondsOfDay = dt.hour * 3600 + dt.minute * 60 + dt.second;
-  
-  // Establecer tiempo en el RTC
-  rtc.setClockTime(secondsOfDay);
-  
-  // Almacenar la fecha actual como referencia
-  currentDay = dt.year * 10000 + dt.month * 100 + dt.day;
+  // Establecer hora y fecha en el RTC
+  rtc.setHours(dt.hour);
+  rtc.setMinutes(dt.minute);
+  rtc.setSeconds(dt.second);
+  rtc.setDay(dt.day);
+  rtc.setMonth(dt.month);
+  rtc.setYear(dt.year - 2000);  // STM32RTC usa años desde 2000
 }
 
 // Obtener fecha y hora actual
 DateTime getCurrentDateTime() {
   DateTime dt;
   
-  // Obtener tiempo del RTC (segundos desde medianoche)
-  uint32_t secondsOfDay = rtc.getTime();
-  
-  // Calcular horas, minutos y segundos
-  dt.hour = (secondsOfDay / 3600) % 24;
-  dt.minute = (secondsOfDay / 60) % 60;
-  dt.second = secondsOfDay % 60;
-  
-  // Extraer año, mes y día de la variable global currentDay
-  dt.year = currentDay / 10000;
-  dt.month = (currentDay / 100) % 100;
-  dt.day = currentDay % 100;
+  // Obtener fecha y hora del RTC
+  dt.hour = rtc.getHours();
+  dt.minute = rtc.getMinutes();
+  dt.second = rtc.getSeconds();
+  dt.day = rtc.getDay();
+  dt.month = rtc.getMonth();
+  dt.year = rtc.getYear() + 2000;  // STM32RTC devuelve años desde 2000
   
   return dt;
 }
@@ -187,8 +189,8 @@ DateTime getCurrentDateTime() {
 // Actualizar el nombre del archivo actual basado en la fecha
 void updateCurrentFilename() {
   DateTime now = getCurrentDateTime();
-  sprintf(currentFilename, "TEMP_%02d%02d.CSV", now.month, now.day);
-  
+  sprintf(currentFilename, "TMP_%02d%02d.CSV", now.month, now.day);
+  Serial.println(currentFilename);
   // Crear el archivo si no existe
   if (!SD.exists(currentFilename) && sdAvailable) {
     dataFile = SD.open(currentFilename, FILE_WRITE);
@@ -227,11 +229,6 @@ void updateCurrentFilename() {
 void cleanupOldFiles() {
   if (!sdAvailable) return;
   
-  DateTime now = getCurrentDateTime();
-  uint16_t currentYear = now.year;
-  uint8_t currentMonth = now.month;
-  uint8_t currentDay = now.day;
-  
   // Crear una matriz para almacenar nombres de archivos
   char fileNames[MAX_DAYS][16];
   int fileCount = 0;
@@ -245,7 +242,7 @@ void cleanupOldFiles() {
     if (!entry) break;
     
     // Verificar si es un archivo de temperatura
-    if (strncmp(entry.name(), "TEMP_", 5) == 0 && 
+    if (strncmp(entry.name(), "TMP_", 4) == 0 && 
         strlen(entry.name()) == 12 &&
         strcmp(entry.name() + 8, ".CSV") == 0) {
       
@@ -282,52 +279,50 @@ void cleanupOldFiles() {
   }
 }
 
+// Obtener timestamp (segundos desde medianoche)
+uint32_t getTimestampSeconds() {
+  uint8_t hour = rtc.getHours();
+  uint8_t minute = rtc.getMinutes();
+  uint8_t second = rtc.getSeconds();
+  
+  return hour * 3600 + minute * 60 + second;
+}
+
 // Configurar la próxima alarma (cada 10 minutos)
 void setupNextAlarm() {
-  // Obtener la hora actual
-  uint32_t currentTime = rtc.getTime();
+  DateTime now = getCurrentDateTime();
   
   // Calcular el próximo tiempo de alarma (actual + 10 minutos)
-  uint32_t alarmTime = currentTime + 600;  // 10 minutos = 600 segundos
+  uint8_t alarmMinute = (now.minute + samplingInterval) % 60;
+  uint8_t alarmHour = now.hour;
   
-  // Ajustar para cambio de día
-  if (alarmTime >= 86400) {  // 24*60*60 segundos en un día
-    alarmTime -= 86400;
+  // Ajustar hora si los minutos dan la vuelta
+  if (alarmMinute < now.minute) {
+    alarmHour = (alarmHour + 1) % 24;
     
-    // Incrementar el día
-    DateTime dt = getCurrentDateTime();
-    dt.day++;
-    
-    // Lógica simple para manejar fin de mes (no es preciso para todos los meses)
-    if ((dt.month == 4 || dt.month == 6 || dt.month == 9 || dt.month == 11) && dt.day > 30) {
-      dt.day = 1;
-      dt.month++;
-    } else if (dt.month == 2) {
-      // Año bisiesto aproximado
-      bool isLeapYear = (dt.year % 4 == 0 && dt.year % 100 != 0) || (dt.year % 400 == 0);
-      if ((isLeapYear && dt.day > 29) || (!isLeapYear && dt.day > 28)) {
-        dt.day = 1;
-        dt.month++;
-      }
-    } else if (dt.day > 31) {
-      dt.day = 1;
-      dt.month++;
-      if (dt.month > 12) {
-        dt.month = 1;
-        dt.year++;
-      }
+    // Si la hora da la vuelta, podría ser un nuevo día
+    if (alarmHour < now.hour) {
+      // Verificar si hay que limpiar archivos antiguos
+      cleanupOldFiles();
+      // La fecha cambiará automáticamente por el RTC
     }
-    
-    // Actualizar la fecha
-    currentDay = dt.year * 10000 + dt.month * 100 + dt.day;
-    
-    // Verificar si hay que limpiar archivos antiguos
-    cleanupOldFiles();
   }
   
-  // Configurar la alarma
-  rtc.setAlarmTime(alarmTime);
-  rtc.attachAlarmInterrupt(NULL);  // No se necesita función de callback, solo establecer la bandera
+  // Configurar la alarma para la próxima medición
+  rtc.setAlarmDay(rtc.getDay());
+  rtc.setAlarmHours(alarmHour);
+  rtc.setAlarmMinutes(alarmMinute);
+  rtc.setAlarmSeconds(0);
+  rtc.enableAlarm(STM32RTC::MATCH_HHMMSS);
+  
+  // Guardar el tiempo de la alarma para respaldo
+  lastAlarmTime = alarmHour * 3600 + alarmMinute * 60;
+  
+  Serial.print("Próxima alarma configurada para: ");
+  Serial.print(alarmHour);
+  Serial.print(":");
+  Serial.print(alarmMinute);
+  Serial.println(":00");
 }
 
 // Formatear fecha y hora como cadena
@@ -338,19 +333,35 @@ String formatDateTime(DateTime dt) {
   return String(buffer);
 }
 
-// Tomar una medición y almacenarla
+
 void takeMeasurement() {
-  if (!sdAvailable || sampleCount >= SAMPLES_PER_DAY) {
+  // Calcular el máximo de muestras por día basado en el intervalo actual
+  maxSamplesPerDay = MINUTES_PER_DAY / samplingInterval;
+  
+  if (!sdAvailable || sampleCount >= maxSamplesPerDay) {
     Serial.println("No se puede guardar más datos o SD no disponible");
     return;
+  }
+  
+  // Verificar si ha cambiado el día
+  DateTime now = getCurrentDateTime();
+  char newFilename[16];
+  sprintf(newFilename, "TMP_%02d%02d.CSV", now.month, now.day);
+  
+  // Si el nombre del archivo ha cambiado, actualizar y reiniciar contador
+  if (strcmp(newFilename, currentFilename) != 0) {
+    strcpy(currentFilename, newFilename);
+    updateCurrentFilename();
+    sampleCount = 0;  // Reiniciar contador al cambiar de día
+    Serial.print("Nuevo archivo creado. Máximo de muestras: ");
+    Serial.println(maxSamplesPerDay);
   }
   
   // Leer el sensor NTC
   float temperature = readNTC();
   
   // Obtener timestamp y fecha/hora actual
-  uint32_t timestamp = rtc.getTime();
-  DateTime now = getCurrentDateTime();
+  uint32_t timestamp = getTimestampSeconds();
   String dateTimeStr = formatDateTime(now);
   
   // Guardar datos en la SD
@@ -365,17 +376,40 @@ void takeMeasurement() {
     dataFile.println(temperature);
     dataFile.close();
     
-    Serial.print("Muestra guardada #");
+    Serial.print("Muestra #");
     Serial.print(sampleCount);
+    Serial.print("/");
+    Serial.print(maxSamplesPerDay);
     Serial.print(" en ");
     Serial.print(currentFilename);
-    Serial.print(": ");
+    Serial.print(" (Int: ");
+    Serial.print(samplingInterval);
+    Serial.print("min): ");
     Serial.print(temperature);
     Serial.println("°C");
     
     sampleCount++;
   } else {
     Serial.println("Error abriendo archivo para guardar datos");
+  }
+}
+
+/**
+ * Establece el nuevo intervalo de muestreo (1-60 minutos)
+ * @param interval Nuevo intervalo en minutos
+ */
+void setSamplingInterval(uint8_t interval) {
+  if(interval >= 1 && interval <= 60) {
+    samplingInterval = interval;
+    maxSamplesPerDay = MINUTES_PER_DAY / samplingInterval;
+    sampleCount = 0; // Reiniciar contador al cambiar intervalo
+    
+    Serial.print("Nuevo intervalo de muestreo: ");
+    Serial.print(samplingInterval);
+    Serial.print(" minutos. Máx muestras/día: ");
+    Serial.println(maxSamplesPerDay);
+  } else {
+    Serial.println("Error: Intervalo debe ser 1-60 minutos");
   }
 }
 
@@ -488,7 +522,7 @@ void checkForRFRequests() {
           if (!entry) break;
           
           // Verificar si es un archivo de temperatura
-          if (strncmp(entry.name(), "TEMP_", 5) == 0 && 
+          if (strncmp(entry.name(), "TMP_", 4) == 0 && 
               strlen(entry.name()) == 12 &&
               strcmp(entry.name() + 8, ".CSV") == 0) {
             
